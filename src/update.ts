@@ -1,20 +1,19 @@
 import slugify from "@sindresorhus/slugify";
 import dayjs from "dayjs";
-import WebSocket from 'ws';
 import { mkdirp, readFile, writeFile } from "fs-extra";
 import { load } from "js-yaml";
 import { join } from "path";
 import { getConfig } from "./helpers/config";
-import { replaceEnvironmentVariables } from "./helpers/environment";
 import { commit, lastCommit, push } from "./helpers/git";
 import { getOctokit } from "./helpers/github";
 import { shouldContinue } from "./helpers/init-check";
 import { sendNotification } from "./helpers/notifme";
-import { ping } from "./helpers/ping";
-import { curl } from "./helpers/request";
 import { getOwnerRepo } from "./helpers/secrets";
-import { SiteHistory } from "./interfaces";
+import { SiteCurrentStatus, SiteHistory } from "./interfaces";
 import { generateSummary } from "./summary";
+import curl from './checks/curl';
+import websocket from './checks/websocket';
+import tcpPing from './checks/tcp-ping';
 
 export const update = async (shouldCommit = false) => {
   if (!(await shouldContinue())) return;
@@ -108,135 +107,17 @@ export const update = async (shouldCommit = false) => {
         httpCode: number;
       };
       responseTime: string;
-      status: "up" | "down" | "degraded";
+      status: SiteCurrentStatus;
     }> => {
-      if (site.check === "tcp-ping") {
-        console.log("Using tcp-ping instead of curl");
-        try {
-          let status: "up" | "down" | "degraded" = "up";
-          const tcpResult = await ping({
-            address: replaceEnvironmentVariables(site.url),
-            attempts: 5,
-            port: Number(replaceEnvironmentVariables(site.port ? String(site.port) : "")),
-          });
-          if(tcpResult.results.every(result => Object.prototype.toString.call((result as any).err) === "[object Error]"))
-            throw Error('all attempts failed');
-          console.log("Got result", tcpResult);
-          let responseTime = (tcpResult.avg || 0).toFixed(0);
-          if (parseInt(responseTime) > (site.maxResponseTime || 60000)) status = "degraded";
-          return {
-            result: { httpCode: 200 },
-            responseTime,
-            status,
-          };
-        } catch (error) {
-          console.log("ERROR Got pinging error", error);
-          return { result: { httpCode: 0 }, responseTime: (0).toFixed(0), status: "down" };
-        }
-      } else if (site.check === "ws") {
-          console.log("Using websocket check instead of curl")
-          let success = false;
-          let status: "up" | "down" | "degraded" = "up";
-          let responseTime = "0";
-        //   promise to await:
-          const connect = () => { 
-              return new Promise(function(resolve, reject) {
-                const ws = new WebSocket(replaceEnvironmentVariables(site.url));
-                ws.on('open', function open() {
-                    if (site.body) {
-                      ws.send(site.body);
-                    } else {
-                      ws.send("");
-                    }
-                    ws.on('message', function message(data){
-                        if(data){
-                            success=true
-                        }
-                    })
-              ws.close();
-              ws.on('close', function close() {
-                console.log('Websocket disconnected');
-              });
-              resolve(ws)
-            });
-            ws.on('error', function error(error: any) {
-                reject(error)
-              });               
-              })
-          }
-        try {
-          const connection = await connect()
-          if(connection) success = true
-          if (success) {
-              status = "up";
-            } else {
-                status = "down";
-            };
-            return {
-                result: { httpCode: 200 },
-                responseTime,
-                status,
-            };
-        }
-     catch (error) {
-        console.log("ERROR Got pinging error from async call", error);
-        return { result: { httpCode: 0 }, responseTime: (0).toFixed(0), status: "down" };
-    }
-      } else {
-        const result = await curl(site);
-        console.log("Result from test", result.httpCode, result.totalTime);
-        const responseTime = (result.totalTime * 1000).toFixed(0);
-        const expectedStatusCodes = (
-          site.expectedStatusCodes || [
-            200,
-            201,
-            202,
-            203,
-            200,
-            204,
-            205,
-            206,
-            207,
-            208,
-            226,
-            300,
-            301,
-            302,
-            303,
-            304,
-            305,
-            306,
-            307,
-            308,
-          ]
-        ).map(Number);
-        let status: "up" | "down" | "degraded" = expectedStatusCodes.includes(
-          Number(result.httpCode)
-        )
-          ? "up"
-          : "down";
-        if (parseInt(responseTime) > (site.maxResponseTime || 60000)) status = "degraded";
-        if (status === "up" && typeof result.data === "string") {
-          if (site.__dangerous__body_down && result.data.includes(site.__dangerous__body_down))
-            status = "down";
-          if (
-            site.__dangerous__body_degraded &&
-            result.data.includes(site.__dangerous__body_degraded)
-          )
-            status = "degraded";
-        }
-        if (
-          site.__dangerous__body_degraded_if_text_missing &&
-          !result.data.includes(site.__dangerous__body_degraded_if_text_missing)
-        )
-          status = "degraded";
-        if (
-          site.__dangerous__body_down_if_text_missing &&
-          !result.data.includes(site.__dangerous__body_down_if_text_missing)
-        )
-          status = "down";
-        return { result, responseTime, status };
+      const checks = {
+        "tcp-ping": tcpPing,
+        "ws": websocket,
+        "http": curl,
       }
+      if (site.check && checks[site.check]) {
+        return checks[site.check](site);
+      }
+      return checks["http"](site);
     };
 
     let { result, responseTime, status } = await performTestOnce();
